@@ -1,0 +1,44 @@
+"""
+bacnet_tagger.py in isolation - no live BACnet device or MQTT needed, just
+token matching over plain dicts shaped like discovery.learn_points' output.
+"""
+
+from fbf.bacnet_tagger import load_rules, tag_point
+
+RULES_PATH = "rules/bacnet_to_haystack_tags.yaml"
+RULES = load_rules(RULES_PATH)
+
+
+def test_load_rules_returns_real_rules():
+    assert len(RULES) >= 10
+    assert {"zone", "air", "temp", "sensor"} in [set(r["tags"]) for r in RULES]
+
+
+def test_tag_point_matches_on_label_tokens():
+    point = {"object_identifier": "analog-value,1", "label": "zone-temp", "units": "degrees-fahrenheit"}
+    assert tag_point(point, RULES) == {"zone": True, "air": True, "temp": True, "sensor": True}
+
+
+def test_tag_point_matches_fan_status_from_learn_example():
+    """Exact shape of the fbf/learn docs example - proves the tagger works
+    on the API's own real response, not a synthetic fixture."""
+    point = {"object_identifier": "binary-value,1", "label": "fan-status", "present_value": "active", "units": None}
+    assert tag_point(point, RULES) == {"fan": True, "run": True, "sensor": True}
+
+
+def test_tag_point_matches_on_description_when_label_is_uninformative():
+    point = {"object_identifier": "analog-value,7", "label": "AV7", "description": "Zone Temp Setpoint"}
+    assert tag_point(point, RULES) == {"zone": True, "air": True, "temp": True, "sp": True}
+
+
+def test_tag_point_returns_empty_dict_for_no_match():
+    point = {"object_identifier": "analog-value,99", "label": "network-port,1", "units": None}
+    assert tag_point(point, RULES) == {}
+
+
+def test_tag_point_prefers_most_specific_rule():
+    """"zone-temp-setpoint" satisfies both the 2-token zone/temp rule and
+    the 3-token zone/temp/setpoint rule - the longer match must win, same
+    tie-break as timberdoodle's classify_point."""
+    point = {"object_identifier": "analog-value,3", "label": "zone-temp-setpoint"}
+    assert tag_point(point, RULES) == {"zone": True, "air": True, "temp": True, "sp": True}

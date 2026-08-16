@@ -1,0 +1,824 @@
+openapi: 3.1.0
+info:
+  title: FBF BACnet & Modbus Discovery, Connections & Devices API
+  version: "1.1.0"
+  description: |
+    The "SkySpark-easy, but via API" surface: discover BACnet devices,
+    learn what points are on one, then create a connection with the
+    points you picked - no hand-typed BACnet object identifiers anywhere
+    in the flow. See `docs/bacnet-discovery-api.md` for the full
+    discover → learn → create-connection recipe with a worked example.
+
+    Modbus has no discovery protocol of its own, so `/modbus/discover`
+    sweeps a user-supplied CIDR on port 502 instead of broadcasting -
+    see `/modbus/discover`'s own description. `/devices` is a periodic-scan
+    result registry, separate from `/connections` and `/modbus/connections`:
+    it tracks every device either kind of scan has ever seen, whether or
+    not a human has provisioned a connection for it yet, plus an optional
+    per-device credential and a best-effort flag for devices still on a
+    factory-default login (see `/devices/{id}/recheck-credentials`).
+
+    This document is served live by the API itself at `GET /openapi.yaml`
+    - it is read straight off disk by the same process handling every
+    other route, not maintained as a separate promise about the code.
+servers:
+  - url: http://localhost:8001
+    description: Local dev default (see `python -m fbf.api --help`)
+paths:
+  /discover:
+    post:
+      operationId: discoverDevices
+      summary: Find BACnet devices (Who-Is / I-Am)
+      description: |
+        Broadcasts Who-Is across the local network by default. Pass
+        `address` to target one specific device instead (a directed
+        Who-Is) - useful for testing on a single host, since a
+        locally-originated broadcast doesn't loop back to another process
+        on the *same* machine over a real physical interface (a
+        macOS/BSD networking behavior, not something this endpoint works
+        around). Both modes use the exact same code path.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiscoverRequest"
+            examples:
+              broadcast:
+                summary: Scan the whole local network
+                value: {}
+              directed:
+                summary: Target one known device (e.g. for same-host testing)
+                value: { "address": "192.168.128.63:47808", "timeout": 5.0 }
+      responses:
+        "200":
+          description: Every device that responded, as a JSON array (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Device"
+              example: [{ "device_instance": 3456, "address": "192.168.128.63", "vendor_id": 999 }]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /learn:
+    post:
+      operationId: learnPoints
+      summary: Enumerate a device's points
+      description: |
+        Reads the device's object list, then batch-reads
+        object-name/present-value/units per object. Every object comes
+        back, points included - a `null` `present_value` (e.g. on a
+        network-port object) is a hint it's not a sensor/actuator point,
+        not an error. `units: null` isn't a bug either: some objects
+        genuinely have no `units` property, and one missing property
+        never hides the rest of a point's fields or the other points on
+        the device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LearnRequest"
+            examples:
+              default:
+                value: { "device_address": "192.168.128.63:47808", "device_instance": 3456 }
+      responses:
+        "200":
+          description: Every object on the device, as a JSON array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LearnedPoint"
+              example:
+                - { "object_identifier": "network-port,1", "label": "NetworkPort-1", "present_value": null, "units": null }
+                - { "object_identifier": "analog-value,1", "label": "zone-temp", "present_value": 71.0, "units": "degrees-fahrenheit" }
+                - { "object_identifier": "binary-value,1", "label": "fan-status", "present_value": "active", "units": null }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /connections:
+    post:
+      operationId: createConnection
+      summary: Create a connection and start polling it immediately
+      description: |
+        Pick whichever points `/learn` returned that you actually want
+        bridged. `label` is just the MQTT topic segment (matches every
+        other bridge's "point is whatever label makes sense" convention)
+        - rename it freely, it doesn't have to match what `/learn`
+        suggested.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConnectionRequest"
+            examples:
+              default:
+                value:
+                  device_address: "192.168.128.63:47808"
+                  device_instance: 3456
+                  topic_prefix: "fbf/ahu-3"
+                  poll_interval: 5.0
+                  points:
+                    - { "object_identifier": "analog-value,1", "label": "zone-temp" }
+                    - { "object_identifier": "binary-value,1", "label": "fan-status" }
+      responses:
+        "201":
+          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every FBF bridge uses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    get:
+      operationId: listConnections
+      summary: List every active connection
+      responses:
+        "200":
+          description: Every connection currently persisted and polling, as a JSON array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Connection"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /connections/{id}:
+    delete:
+      operationId: deleteConnection
+      summary: Stop and remove a connection
+      description: Cancels the poll task and removes it from persisted state - a restarted `fbf.api` process will not resume it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: 419dff013a6d4d7783b43e6603ccefd7
+      responses:
+        "204":
+          description: Deleted. No response body.
+        "404":
+          description: No connection with that id.
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /connections/{id}/credential:
+    patch:
+      operationId: setConnectionCredential
+      summary: Set (or replace) the login this connection's device needs
+      description: >-
+        Neither BACnet nor Modbus has protocol-level auth - this is purely
+        bookkeeping for whatever manual login the physical device or its
+        gateway needs (e.g. its own local web UI). Stored encrypted at
+        rest. The response shows the plaintext password once, at set time
+        only - every later `GET /connections` redacts it to `null`, same
+        pattern as `/webhooks`'s `secret` in timberdoodle's fault API.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetCredentialRequest"
+      responses:
+        "200":
+          description: Set. Password shown once, here only.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CredentialResponse"
+        "404":
+          description: No connection with that id.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /modbus/discover:
+    post:
+      operationId: discoverModbusDevices
+      summary: Sweep a subnet for Modbus/TCP devices
+      description: >-
+        Modbus has no discovery protocol - this TCP-connect-scans every
+        host in `cidr` on `port` (bounded to `concurrency` simultaneous
+        attempts) and, where the device implements it, best-effort reads
+        its Basic Device Identification (Modbus function 0x2B/0x0E) for
+        vendor/product/revision. A device that doesn't implement 0x2B/0x0E
+        is still a real find - it comes back with those three fields
+        `null`, not omitted from the results or treated as an error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModbusDiscoverRequest"
+            examples:
+              default:
+                value: { "cidr": "192.168.1.0/24" }
+      responses:
+        "200":
+          description: Every host that accepted a Modbus TCP connection, as a JSON array (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ModbusDevice"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /modbus/connections:
+    post:
+      operationId: createModbusConnection
+      summary: Create a Modbus connection and start polling it immediately
+      description: >-
+        Modbus has no self-describing object list the way BACnet does -
+        register addresses are opaque and vendor-documented, so `points`
+        is a plain `{label: register_address}` map you supply directly,
+        not something a `/learn`-equivalent suggests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateModbusConnectionRequest"
+            examples:
+              default:
+                value:
+                  host: "192.168.1.50"
+                  port: 502
+                  topic_prefix: "fbf/modbus-ahu-1"
+                  poll_interval: 5.0
+                  points: { "zone-temp": 0, "fan-status": 1 }
+      responses:
+        "201":
+          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every FBF bridge uses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModbusConnection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    get:
+      operationId: listModbusConnections
+      summary: List every active Modbus connection
+      responses:
+        "200":
+          description: Every Modbus connection currently persisted and polling, as a JSON array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ModbusConnection"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /modbus/connections/{id}:
+    delete:
+      operationId: deleteModbusConnection
+      summary: Stop and remove a Modbus connection
+      description: Cancels the poll task and removes it from persisted state - a restarted `fbf.api` process will not resume it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted. No response body.
+        "404":
+          description: No connection with that id.
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /modbus/connections/{id}/credential:
+    patch:
+      operationId: setModbusConnectionCredential
+      summary: Set (or replace) the login this Modbus connection's device needs
+      description: Same shape and reasoning as `PATCH /connections/{id}/credential`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetCredentialRequest"
+      responses:
+        "200":
+          description: Set. Password shown once, here only.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CredentialResponse"
+        "404":
+          description: No connection with that id.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /devices:
+    get:
+      operationId: listDevices
+      summary: List every device either periodic scan has ever seen
+      description: >-
+        Populated by the periodic BACnet Who-Is scan (always running,
+        interval set by `--bacnet-discovery-interval`) and, if configured,
+        one or more periodic Modbus CIDR sweeps (`--modbus-scan-cidr`, off
+        by default - no safe subnet to guess). `status` is `pending`
+        (seen, no connection provisioned yet), `provisioned` (a matching
+        connection exists), or `ignored` (a human dismissed it - survives
+        rescans). `default_credential_flag` is always `null` for BACnet
+        devices (no HTTP-login concept applies) and best-effort for Modbus
+        devices (see `/devices/{id}/recheck-credentials`).
+      responses:
+        "200":
+          description: Every known device, as a JSON array, credentials redacted.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeviceRecord"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /devices/{id}:
+    patch:
+      operationId: setDeviceStatus
+      summary: Set a device's status (e.g. dismiss it as "ignored")
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [pending, provisioned, ignored]
+      responses:
+        "200":
+          description: Updated device record, credentials redacted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRecord"
+        "404":
+          description: No device with that id.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /devices/{id}/credential:
+    patch:
+      operationId: setDeviceCredential
+      summary: Set (or replace) the login a discovered-but-not-yet-provisioned device needs
+      description: >-
+        For a device that needs a credential recorded before any
+        connection exists for it yet (e.g. a gateway's web login that
+        will never be polled as a point). Same shape and reasoning as
+        `PATCH /connections/{id}/credential`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetCredentialRequest"
+      responses:
+        "200":
+          description: Set. Password shown once, here only.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CredentialResponse"
+        "404":
+          description: No device with that id.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /devices/{id}/recheck-credentials:
+    post:
+      operationId: recheckDeviceDefaultCredentials
+      summary: Re-run the default-credential check against this device
+      description: >-
+        Automatically run once, the first time a Modbus device is seen as
+        `pending` (never for BACnet - see `/devices`'s description). This
+        lets a human re-trigger it later, e.g. after changing the
+        device's password, to confirm `default_credential_flag` clears.
+        A short hardcoded list of common defaults (admin/admin, etc.)
+        tried as HTTP Basic Auth against the device's own address, GET
+        only, non-destructive.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated device record, credentials redacted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRecord"
+        "404":
+          description: No device with that id.
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /openapi.yaml:
+    get:
+      operationId: getOpenApiSpec
+      summary: This document
+      description: Served raw, straight off disk - the same file you're reading right now.
+      responses:
+        "200":
+          description: The OpenAPI 3.1 spec for this API, as YAML.
+          content:
+            application/yaml:
+              schema:
+                type: string
+components:
+  schemas:
+    DiscoverRequest:
+      type: object
+      properties:
+        low_limit:
+          type: integer
+          description: Lower bound of the device-instance range to scan. Requires high_limit.
+        high_limit:
+          type: integer
+          description: Upper bound of the device-instance range to scan. Requires low_limit.
+        address:
+          type: string
+          description: Target one specific device (directed Who-Is) instead of broadcasting.
+          example: "192.168.128.63:47808"
+        timeout:
+          type: number
+          description: Seconds to wait for I-Am responses. Defaults to bacpypes3's own Who-Is timeout (3s) if omitted.
+          example: 5.0
+    Device:
+      type: object
+      required: [device_instance, address, vendor_id]
+      properties:
+        device_instance:
+          type: integer
+          example: 3456
+        address:
+          type: string
+          description: BACnet/IP address the device responded from (no port - the standard BACnet/IP port 47808 is implied and works automatically in every other call that takes an address).
+          example: "192.168.128.63"
+        vendor_id:
+          type: integer
+          example: 999
+    LearnRequest:
+      type: object
+      required: [device_address, device_instance]
+      properties:
+        device_address:
+          type: string
+          example: "192.168.128.63:47808"
+        device_instance:
+          type: integer
+          example: 3456
+    LearnedPoint:
+      type: object
+      required: [object_identifier, label]
+      properties:
+        object_identifier:
+          type: string
+          description: The real BACnet object identifier - what create-a-connection needs, not a display name.
+          example: "analog-value,1"
+        label:
+          type: string
+          description: object-name if the device reports one, otherwise falls back to the object_identifier itself.
+          example: zone-temp
+        present_value:
+          description: Current value at learn time - a snapshot, not a live feed. null if the object has none (e.g. a network-port) or the property read failed.
+          oneOf: [{ type: number }, { type: string }, { type: boolean }, { type: "null" }]
+          example: 71.0
+        units:
+          type: ["string", "null"]
+          example: degrees-fahrenheit
+    PointRef:
+      type: object
+      required: [object_identifier, label]
+      properties:
+        object_identifier:
+          type: string
+          example: "analog-value,1"
+        label:
+          type: string
+          description: MQTT topic segment for this point - freely renameable from what /learn suggested.
+          example: zone-temp
+        poll_interval:
+          type: number
+          description: Seconds between reads of this specific point, overriding the connection-level default. Each point runs its own independent poll loop - a fast-changing point and a slow one on the same device don't have to share a cadence.
+          example: 1.0
+        his_collect_cov:
+          description: >-
+            Enables change-of-value filtering for this point, matching
+            Haystack's own `hisCollectCov` semantics: `true` publishes on
+            any change; a number is a numeric tolerance the value must
+            move by before it's published (non-numeric values always
+            compare by equality regardless). Omit to publish every poll
+            unconditionally (the default).
+          oneOf: [{ type: boolean }, { type: number }]
+          example: 0.5
+        his_collect_cov_rate_limit:
+          type: number
+          description: Never publish COV-triggered changes faster than this many seconds apart, even if the value keeps changing. Only meaningful alongside his_collect_cov.
+          example: 5.0
+        his_collect_interval:
+          type: number
+          description: Alternative to his_collect_cov - publish at most this often regardless of whether the value changed, independent of poll_interval (matches Haystack's hisCollectInterval).
+          example: 300.0
+    CreateConnectionRequest:
+      type: object
+      required: [device_address, device_instance, topic_prefix, points]
+      properties:
+        device_address:
+          type: string
+          example: "192.168.128.63:47808"
+        device_instance:
+          type: integer
+          example: 3456
+        topic_prefix:
+          type: string
+          description: MQTT topic prefix every point on this connection publishes under, as `{topic_prefix}/{label}`.
+          example: fbf/ahu-3
+        poll_interval:
+          type: number
+          description: Seconds between poll cycles.
+          default: 5.0
+          example: 5.0
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/PointRef"
+        credential:
+          description: Optional - the login this device's own UI/gateway needs, if any. Write-only on create; a created/listed Connection always shows this redacted (see RedactedCredential).
+          oneOf:
+            - $ref: "#/components/schemas/SetCredentialRequest"
+            - type: "null"
+    Connection:
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              example: 419dff013a6d4d7783b43e6603ccefd7
+            credential:
+              $ref: "#/components/schemas/RedactedCredential"
+        - $ref: "#/components/schemas/CreateConnectionRequest"
+    SetCredentialRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          example: admin
+        password:
+          type: string
+          description: Stored encrypted at rest (Fernet, keyed by the FBF_CREDENTIAL_KEY env var) - never returned in plaintext again after this call's response.
+          example: sup3r-secret
+    CredentialResponse:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          example: admin
+        password:
+          type: string
+          description: Shown once, here only - every later GET of the owning record redacts this to null.
+          example: sup3r-secret
+    RedactedCredential:
+      type: ["object", "null"]
+      description: null if no credential has been set for this device/connection.
+      properties:
+        username:
+          type: string
+          example: admin
+        password:
+          type: "null"
+          description: Always null in any GET/list response - see CredentialResponse for the one-time-shown plaintext.
+    ModbusDiscoverRequest:
+      type: object
+      required: [cidr]
+      properties:
+        cidr:
+          type: string
+          description: Subnet to sweep, in CIDR notation. No default - Modbus periodic/on-demand discovery only ever scans a subnet the operator explicitly supplied.
+          example: "192.168.1.0/24"
+        port:
+          type: integer
+          default: 502
+        concurrency:
+          type: integer
+          description: Max simultaneous TCP-connect attempts, bounded so a large sweep doesn't exhaust local ephemeral ports/file descriptors.
+          default: 32
+        timeout:
+          type: number
+          description: Seconds to wait for each host's TCP connect.
+          default: 2.0
+    ModbusDevice:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: string
+          example: "192.168.1.50"
+        port:
+          type: integer
+          example: 502
+        vendor:
+          type: ["string", "null"]
+          description: From Modbus function 0x2B/0x0E (Read Device Identification) - null if the device doesn't implement it, which is common and not an error.
+          example: "Acme Controls"
+        product_code:
+          type: ["string", "null"]
+          example: "X1-2000"
+        revision:
+          type: ["string", "null"]
+          example: "2.0"
+    ModbusPoints:
+      type: object
+      description: '{label: holding_register_address} - Modbus has no self-describing object list, so these are supplied directly, vendor-documented addresses.'
+      additionalProperties:
+        type: integer
+      example: { "zone-temp": 0, "fan-status": 1 }
+    CreateModbusConnectionRequest:
+      type: object
+      required: [host, topic_prefix, points]
+      properties:
+        host:
+          type: string
+          example: "192.168.1.50"
+        port:
+          type: integer
+          default: 502
+        device_id:
+          type: integer
+          description: Modbus unit/slave id.
+          default: 1
+        topic_prefix:
+          type: string
+          description: MQTT topic prefix every point on this connection publishes under, as `{topic_prefix}/{label}`.
+          example: fbf/modbus-ahu-1
+        poll_interval:
+          type: number
+          description: Seconds between poll cycles - one shared interval for every point on this connection (unlike BACnet connections, Modbus connections don't support a per-point poll_interval).
+          default: 5.0
+        points:
+          $ref: "#/components/schemas/ModbusPoints"
+        credential:
+          oneOf:
+            - $ref: "#/components/schemas/SetCredentialRequest"
+            - type: "null"
+    ModbusConnection:
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+            credential:
+              $ref: "#/components/schemas/RedactedCredential"
+        - $ref: "#/components/schemas/CreateModbusConnectionRequest"
+    DeviceRecord:
+      type: object
+      required: [id, protocol, first_seen_at, last_seen_at, status]
+      description: One entry per device either periodic scan has ever seen - see GET /devices for the full status/default_credential_flag semantics.
+      properties:
+        id:
+          type: string
+        protocol:
+          type: string
+          enum: [bacnet, modbus]
+        device_instance:
+          type: ["integer", "null"]
+          description: BACnet only.
+        address:
+          type: ["string", "null"]
+          description: BACnet only.
+        vendor_id:
+          type: ["integer", "null"]
+          description: BACnet only.
+        host:
+          type: ["string", "null"]
+          description: Modbus only.
+        port:
+          type: ["integer", "null"]
+          description: Modbus only.
+        vendor:
+          type: ["string", "null"]
+          description: Modbus only.
+        product_code:
+          type: ["string", "null"]
+          description: Modbus only.
+        revision:
+          type: ["string", "null"]
+          description: Modbus only.
+        first_seen_at:
+          type: number
+          description: Unix epoch seconds.
+        last_seen_at:
+          type: number
+          description: Unix epoch seconds.
+        status:
+          type: string
+          enum: [pending, provisioned, ignored]
+        connection_id:
+          type: ["string", "null"]
+          description: Set once a matching connection exists for this device.
+        credential:
+          $ref: "#/components/schemas/RedactedCredential"
+        default_credential_flag:
+          type: ["object", "null"]
+          description: Set if the best-effort default-credential check found one that worked. Always null for BACnet devices (no HTTP-login concept applies - see /devices's description).
+          properties:
+            username:
+              type: string
+              example: admin
+            password:
+              type: string
+              example: admin
+            scheme:
+              type: string
+              enum: [http, https]
+            checked_at:
+              type: number
+              description: Unix epoch seconds.
+        default_credential_checked_at:
+          type: ["number", "null"]
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable explanation of what went wrong.
+  responses:
+    BadRequest:
+      description: Malformed JSON body, or a required field was missing.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "'device_address'" }
+    Timeout:
+      description: Timed out waiting on the BACnet stack (an unreachable device, or a stalled internal call).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "timed out waiting on the BACnet stack" }
+    ServerError:
+      description: Unexpected internal error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

@@ -1,0 +1,14 @@
+//
+// Config: sql
+//
+// History:
+//   01 Feb 10  Brian Frank  Creation
+//
+
+// Java JDBC drivers; these are java classnames separated by a comma
+// which are loaded into the VM using Class.forName on startup
+// java.drivers=com.mysql.cj.jdbc.Driver
+
+// Uncomment this line to revert old "@@" escape behavior.
+// See https://github.com/fantom-lang/fantom/pull/51
+// deprecatedEscape=true

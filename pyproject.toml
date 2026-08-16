@@ -1,0 +1,32 @@
+[project]
+name = "fbf"
+version = "0.1.0"
+description = "Free BACnet Ferry — bridges BACnet and Modbus devices to MQTT, no Fantom required"
+requires-python = ">=3.10"
+dependencies = [
+    "bacpypes3>=0.0.6",
+    "paho-mqtt>=2.1.0",
+    "pymodbus>=3.14.0",
+    "pyhaystack>=3.0.0",
+    "requests>=2.31.0",
+    "cryptography>=42",
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "openapi-spec-validator>=0.7.0", "jsonschema>=4.0.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires live services (Haxall, mosquitto, mock devices)",
+]
