@@ -14,7 +14,10 @@ class FakeMqttClient:
     def __init__(self):
         self.published: list[tuple[str, str]] = []
 
-    def publish(self, topic, payload, retain=True):
+    def is_connected(self):
+        return True
+
+    def publish(self, topic, payload, qos=0, retain=True):
         self.published.append((topic, payload))
 
 
