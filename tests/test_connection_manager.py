@@ -7,12 +7,11 @@ import asyncio
 import json
 import time
 
-import paho.mqtt.client as mqtt
+import mqtt_test_util
 import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf import mqtt_sink
 from fbf.connection_manager import ConnectionManager
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
@@ -31,10 +30,10 @@ def test_create_connection_polls_and_delete_stops_it(tmp_path):
 
     async def run():
         app = _make_app(47813)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = {}
         sub.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
         sub.connect("localhost", 1883)
@@ -86,7 +85,7 @@ def test_start_restores_persisted_connections_and_resumes_polling(tmp_path):
 
     async def create_then_persist():
         app = _make_app(47814)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, state_file)
         try:
             await asyncio.sleep(1)
@@ -103,10 +102,10 @@ def test_start_restores_persisted_connections_and_resumes_polling(tmp_path):
 
     async def restore_and_observe():
         app = _make_app(47815)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, state_file)
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = {}
         sub.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
         sub.connect("localhost", 1883)
@@ -143,10 +142,10 @@ def test_per_point_poll_interval_yields_different_real_cadences(tmp_path):
 
     async def run():
         app = _make_app(47817)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         counts = {"fast": 0, "slow": 0}
         sub.on_message = lambda c, u, msg: counts.__setitem__(msg.topic.rsplit("/", 1)[-1], counts[msg.topic.rsplit("/", 1)[-1]] + 1)
         sub.connect("localhost", 1883)
@@ -193,10 +192,10 @@ def test_his_collect_cov_suppresses_unchanged_readings(tmp_path):
 
     async def run():
         app = _make_app(47818)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = []
         # /tags is a real, separate message the connection now publishes once
         # at connection-creation time (bacnet_tagger auto-tagging) - excluded

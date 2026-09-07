@@ -50,3 +50,7 @@ they're bacpypes3's own local-BACnet-address arg, same as
 `fbf.api` also runs periodic BACnet/Modbus discovery on its own and tracks
 every device it's seen, provisioned or not, with optional per-device
 credentials - see `docs/periodic-discovery-and-credentials.md`.
+
+A central Timberdoodle deployment can also reach back into a site to
+trigger a scan remotely, over the same outbound MQTT connection - see
+`docs/command-channel.md`.

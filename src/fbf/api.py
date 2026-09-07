@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -47,6 +48,27 @@ def _redact(record: dict) -> dict:
     through this - password_ciphertext never appears in an API response,
     same shape as timberdoodle/webhooks.py's `_redact_webhook`."""
     return {**record, "credential": credentials.redact(record.get("credential"))}
+
+
+# The three actions multi-site.mdx's command channel dispatches by name -
+# same logic the /discover, /learn, and /modbus/discover HTTP routes call,
+# extracted so both callers share one implementation instead of the MQTT
+# path re-deriving it.
+async def handle_discover(manager: ConnectionManager, body: dict) -> list:
+    return await manager.discover(**body)
+
+
+async def handle_learn(manager: ConnectionManager, body: dict) -> list:
+    return await manager.learn(body["device_address"], body["device_instance"])
+
+
+async def handle_modbus_discover(body: dict) -> list:
+    return await modbus_discovery.sweep(
+        body["cidr"],
+        port=body.get("port", modbus_discovery.DEFAULT_PORT),
+        concurrency=body.get("concurrency", modbus_discovery.DEFAULT_CONCURRENCY),
+        timeout=body.get("timeout", modbus_discovery.DEFAULT_TIMEOUT),
+    )
 
 
 def make_handler(
@@ -98,7 +120,7 @@ def make_handler(
             if self.path == "/discover":
                 def handle(span):
                     body = self._read_json_body()
-                    devices = _run(manager.discover(**body), loop)
+                    devices = _run(handle_discover(manager, body), loop)
                     span.set_attribute("device_count", len(devices))
                     self._respond_json(200, devices)
 
@@ -108,7 +130,7 @@ def make_handler(
             if self.path == "/learn":
                 def handle(span):
                     body = self._read_json_body()
-                    points = _run(manager.learn(body["device_address"], body["device_instance"]), loop)
+                    points = _run(handle_learn(manager, body), loop)
                     span.set_attribute("point_count", len(points))
                     self._respond_json(200, points)
 
@@ -141,15 +163,7 @@ def make_handler(
             if self.path == "/modbus/discover":
                 def handle(span):
                     body = self._read_json_body()
-                    devices = _run(
-                        modbus_discovery.sweep(
-                            body["cidr"],
-                            port=body.get("port", modbus_discovery.DEFAULT_PORT),
-                            concurrency=body.get("concurrency", modbus_discovery.DEFAULT_CONCURRENCY),
-                            timeout=body.get("timeout", modbus_discovery.DEFAULT_TIMEOUT),
-                        ),
-                        loop,
-                    )
+                    devices = _run(handle_modbus_discover(body), loop)
                     span.set_attribute("device_count", len(devices))
                     self._respond_json(200, devices)
 
@@ -352,6 +366,41 @@ def make_handler(
     return ConnectionsHandler
 
 
+def _make_on_command(manager: ConnectionManager, loop: asyncio.AbstractEventLoop, site_id: str, instance_id: str):
+    """multi-site.mdx's command channel: a {"action": ..., ...} message on
+    cmd/{site_id}/{instance_id}/# dispatches to the same handler its own
+    HTTP route calls, and the outcome is published to .../result so a
+    command isn't fire-and-forget. Runs on paho's network thread (same
+    blocking-call shape as an HTTP handler's worker thread) - one command
+    processes at a time, which is fine for scans you don't want overlapping.
+    """
+    handlers = {
+        "discover": lambda body: handle_discover(manager, body),
+        "learn": lambda body: handle_learn(manager, body),
+        "modbus_discover": lambda body: handle_modbus_discover(body),
+    }
+
+    def on_command(client, userdata, msg):
+        with tracer.start_as_current_span("api.on_command") as span:
+            span.set_attribute("topic", msg.topic)
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+                handler = handlers[payload["action"]]
+                body = {k: v for k, v in payload.items() if k != "action"}
+            except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
+                span.set_attribute("error", str(exc))
+                print(f"malformed command on {msg.topic}: {exc!r}")
+                return
+            try:
+                outcome = {"ok": True, "result": _run(handler(body), loop)}
+            except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
+                span.set_attribute("error", str(exc))
+                outcome = {"ok": False, "error": str(exc)}
+            client.publish(f"cmd/{site_id}/{instance_id}/result", json.dumps(outcome), qos=1)
+
+    return on_command
+
+
 def _crash_logger(task_name: str):
     """An unhandled exception in an asyncio.Task otherwise dies silently -
     same reasoning as connection_manager.py's _make_crash_logger, applied
@@ -375,17 +424,36 @@ async def async_main(args) -> None:
     app = Application.from_args(args)
     await asyncio.sleep(1)  # let transport setup finish, same as bridge.py
 
-    mqtt_client = mqtt_sink.connect(args.mqtt_host, args.mqtt_port)
+    loop = asyncio.get_event_loop()
+
+    # multi-site.mdx's command channel: only meaningful once this process
+    # has a stable site/instance identity - a bare `fbf` run with neither
+    # set behaves exactly as before (fresh session, no command topic).
+    command_topic = f"cmd/{args.site_id}/{args.instance_id}/#" if args.site_id else None
+
+    def _resubscribe_commands(client, userdata, flags, reason_code, properties):
+        client.subscribe(command_topic, qos=1)
+
+    mqtt_client = mqtt_sink.connect(
+        args.mqtt_host,
+        args.mqtt_port,
+        client_id=f"fbf-{args.site_id}-{args.instance_id}" if args.site_id else None,
+        clean_session=False if args.site_id else None,
+        username=args.mqtt_username,
+        password=args.mqtt_password,
+        on_connect_extra=_resubscribe_commands if command_topic else None,
+    )
     manager = ConnectionManager(app, mqtt_client, args.state_file)
     await manager.start()
 
     modbus_manager = ModbusConnectionManager(mqtt_client, args.modbus_state_file)
     await modbus_manager.start()
 
+    if command_topic:
+        mqtt_client.message_callback_add(command_topic, _make_on_command(manager, loop, args.site_id, args.instance_id))
+
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
-
-    loop = asyncio.get_event_loop()
 
     bacnet_scan_task = loop.create_task(
         device_registry.run_periodic_bacnet_scan(app, manager, args.bacnet_discovery_interval)
@@ -426,6 +494,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--mqtt-host", default="localhost")
     parser.add_argument("--mqtt-port", type=int, default=1883)
+    parser.add_argument("--mqtt-username", default=os.environ.get("MQTT_USERNAME"))
+    parser.add_argument("--mqtt-password", default=os.environ.get("MQTT_PASSWORD"))
+    parser.add_argument(
+        "--site-id",
+        default=os.environ.get("FBF_SITE_ID"),
+        help="Enables multi-site.mdx's command channel (cmd/<site-id>/<instance-id>/#) and a "
+        "persistent MQTT session. Unset (default) behaves exactly as before - no command topic.",
+    )
+    parser.add_argument("--instance-id", default=os.environ.get("FBF_INSTANCE_ID", socket.gethostname()))
     parser.add_argument("--state-file", default="fbf-connections.json")
     parser.add_argument("--modbus-state-file", default="fbf-modbus-connections.json")
     parser.add_argument("--devices-state-file", default="fbf-devices.json")

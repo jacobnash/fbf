@@ -15,6 +15,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 import jsonschema
+import mqtt_test_util
 import pytest
 import yaml
 from bacpypes3.app import Application
@@ -23,7 +24,6 @@ from openapi_spec_validator import validate
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
-from fbf import mqtt_sink
 from fbf.api import OPENAPI_SPEC_PATH, make_handler
 from fbf.connection_manager import ConnectionManager
 from fbf.device_registry import DeviceRegistry
@@ -105,7 +105,7 @@ def test_full_flow_matches_documented_schemas(tmp_path, spec):
 
     async def run():
         app = _make_app(47822)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
         await manager.start()
         modbus_manager = ModbusConnectionManager(mqtt_client, str(tmp_path / "modbus-connections.json"))

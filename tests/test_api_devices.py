@@ -13,12 +13,13 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
+import mqtt_test_util
 import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 from cryptography.fernet import Fernet
 
-from fbf import discovery, mqtt_sink
+from fbf import discovery
 from fbf.api import make_handler
 from fbf.connection_manager import ConnectionManager
 from fbf.device_registry import DeviceRegistry
@@ -72,7 +73,7 @@ def test_periodic_bacnet_scan_populates_devices_then_provisioned(tmp_path, monke
 
     async def run():
         app = _make_app(47819)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
         await manager.start()
         modbus_manager = ModbusConnectionManager(mqtt_client, str(tmp_path / "modbus-connections.json"))
@@ -150,7 +151,7 @@ def test_modbus_discover_create_list_delete_flow(mock_modbus_device, tmp_path, m
 
     async def run():
         app = _make_app(47820)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
         await manager.start()
         modbus_manager = ModbusConnectionManager(mqtt_client, str(tmp_path / "modbus-connections.json"))

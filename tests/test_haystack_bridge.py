@@ -3,10 +3,9 @@ import json
 import time
 
 import hszinc
-import paho.mqtt.client as mqtt
+import mqtt_test_util
 import pytest
 
-from fbf import mqtt_sink
 from fbf.haxall_client import connect
 from fbf.haystack_bridge import extract_tags, publish_equip_tags, run_read_mode, run_write_mode, slug, to_jsonable
 
@@ -107,8 +106,8 @@ def session():
 
 @pytest.mark.integration
 def test_read_mode_publishes_values_and_tags(session):
-    pub_client = mqtt_sink.connect("localhost", 1883)
-    sub_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    pub_client = mqtt_test_util.connect()
+    sub_client = mqtt_test_util.subscriber_client()
     received = {}
     sub_client.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
     sub_client.connect("localhost", 1883)
@@ -153,8 +152,8 @@ def test_read_mode_publishes_values_and_tags(session):
 
 @pytest.mark.integration
 def test_publish_equip_tags_publishes_one_message_per_equip_and_site(session):
-    client = mqtt_sink.connect("localhost", 1883)
-    sub_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client = mqtt_test_util.connect()
+    sub_client = mqtt_test_util.subscriber_client()
     received = {}
     sub_client.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
     sub_client.connect("localhost", 1883)
@@ -177,6 +176,6 @@ def test_publish_equip_tags_publishes_one_message_per_equip_and_site(session):
 
 @pytest.mark.integration
 def test_write_mode_readback_matches_written_value(session):
-    client = mqtt_sink.connect("localhost", 1883)
+    client = mqtt_test_util.connect()
     readback = run_write_mode(session, client, "fbf/haxall-readback", 55.5)
     assert readback == 55.5

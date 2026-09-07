@@ -20,12 +20,11 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-import paho.mqtt.client as mqtt
+import mqtt_test_util
 import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf import mqtt_sink
 from fbf.api import make_handler
 from fbf.connection_manager import ConnectionManager
 from fbf.device_registry import DeviceRegistry
@@ -62,7 +61,7 @@ def test_full_discover_learn_create_list_delete_flow(tmp_path):
 
     async def run():
         app = _make_app(47816)
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ConnectionManager(app, mqtt_client, str(tmp_path / "connections.json"))
         await manager.start()
         modbus_manager = ModbusConnectionManager(mqtt_client, str(tmp_path / "modbus-connections.json"))
@@ -77,7 +76,7 @@ def test_full_discover_learn_create_list_delete_flow(tmp_path):
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = {}
         sub.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
         sub.connect("localhost", 1883)

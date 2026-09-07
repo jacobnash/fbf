@@ -90,9 +90,37 @@ def _on_connect(client, userdata, flags, reason_code, properties) -> None:
     _flush_spool(client)
 
 
-def connect(host: str, port: int) -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_connect = _on_connect
+def connect(
+    host: str,
+    port: int,
+    client_id: str | None = None,
+    clean_session: bool | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    on_connect_extra=None,
+) -> mqtt.Client:
+    """client_id/clean_session are only worth setting once this process has
+    a stable identity (see api.py's --site-id) - a persistent session lets
+    mosquitto queue messages (e.g. commands, see multi-site.mdx) while this
+    client is offline instead of dropping them; without a stable identity
+    every restart would get a fresh session anyway, so there's nothing to
+    persist. on_connect_extra runs after the spool flush on every (re)connect
+    - e.g. api.py uses it to resubscribe to its command topic."""
+    kwargs = {}
+    if client_id is not None:
+        kwargs["client_id"] = client_id
+    if clean_session is not None:
+        kwargs["clean_session"] = clean_session
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, **kwargs)
+    if username:
+        client.username_pw_set(username, password or "")
+
+    def _combined_on_connect(client, userdata, flags, reason_code, properties) -> None:
+        _on_connect(client, userdata, flags, reason_code, properties)
+        if on_connect_extra is not None:
+            on_connect_extra(client, userdata, flags, reason_code, properties)
+
+    client.on_connect = _combined_on_connect
     client.connect(host, port)
     client.loop_start()
     return client

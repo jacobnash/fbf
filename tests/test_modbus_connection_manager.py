@@ -7,10 +7,9 @@ import asyncio
 import json
 import time
 
-import paho.mqtt.client as mqtt
+import mqtt_test_util
 import pytest
 
-from fbf import mqtt_sink
 from fbf.modbus_connection_manager import ModbusConnectionManager
 
 
@@ -19,10 +18,10 @@ def test_create_connection_polls_and_delete_stops_it(tmp_path, mock_modbus_devic
     topic_prefix = f"fbf/modbus-conn-mgr-test-{int(time.time())}"
 
     async def run():
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ModbusConnectionManager(mqtt_client, str(tmp_path / "modbus-connections.json"))
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = {}
         sub.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
         sub.connect("localhost", 1883)
@@ -71,7 +70,7 @@ def test_start_restores_persisted_connections_and_resumes_polling(tmp_path, mock
     state_file = str(tmp_path / "modbus-connections.json")
 
     async def create_then_persist():
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ModbusConnectionManager(mqtt_client, state_file)
         try:
             await manager.create_connection(
@@ -90,10 +89,10 @@ def test_start_restores_persisted_connections_and_resumes_polling(tmp_path, mock
             mqtt_client.loop_stop()
 
     async def restore_and_observe():
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ModbusConnectionManager(mqtt_client, state_file)
 
-        sub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        sub = mqtt_test_util.subscriber_client()
         received = {}
         sub.on_message = lambda c, u, msg: received.update({msg.topic: json.loads(msg.payload)})
         sub.connect("localhost", 1883)
@@ -128,7 +127,7 @@ def test_credential_round_trips_through_persistence(tmp_path, mock_modbus_device
     state_file = str(tmp_path / "modbus-connections.json")
 
     async def run():
-        mqtt_client = mqtt_sink.connect("localhost", 1883)
+        mqtt_client = mqtt_test_util.connect()
         manager = ModbusConnectionManager(mqtt_client, state_file)
         try:
             record = await manager.create_connection(
