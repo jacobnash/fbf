@@ -11,6 +11,15 @@ sweeps on a timer) and reconciles their results against this registry plus
 whichever devices are already provisioned as real connections.
 """
 
+# Needed for the type hints below to work at all - `def list(self) -> ...`
+# shadows the builtin `list` for every annotation later in this class body
+# (Python evaluates them eagerly at class-definition time otherwise), so
+# reconcile_bacnet's `devices: list[dict]` was crashing with
+# "'function' object is not subscriptable" on import, before this. This
+# makes annotations lazy strings instead, sidestepping the shadowing
+# without renaming the public list() method.
+from __future__ import annotations
+
 import asyncio
 import time
 
