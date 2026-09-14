@@ -54,3 +54,10 @@ credentials - see `docs/periodic-discovery-and-credentials.md`.
 A central Timberdoodle deployment can also reach back into a site to
 trigger a scan remotely, over the same outbound MQTT connection - see
 `docs/command-channel.md`.
+
+## License
+
+AGPLv3 — see [LICENSE](LICENSE). Same terms as
+[Timberdoodle](https://github.com/jacobnash/timberdoodle): self-host
+freely, but a modified version run as a network service for others must
+make its source available to them too.

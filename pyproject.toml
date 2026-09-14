@@ -2,6 +2,7 @@
 name = "fbf"
 version = "0.1.0"
 description = "Free BACnet Ferry — bridges BACnet and Modbus devices to MQTT, no Fantom required"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [
     "bacpypes3>=0.0.6",
